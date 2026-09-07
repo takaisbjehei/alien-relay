@@ -5,7 +5,7 @@ on:
       file_index:
         description: torrent file index (1-31)
         required: true
-        default: '31'
+        default: '25'
 jobs:
   download-upload:
     runs-on: ubuntu-latest
@@ -21,7 +21,7 @@ jobs:
         run: |
           IDX=${{ github.event.inputs.file_index }}
           TORRENT=meta/169257f30c3fbee583cc3605e9653549a59a9523.torrent
-          aria2c --select-file=$IDX --bt-remove-unselected-file=true --seed-time=0 --file-allocation=none --enable-dht=true --summary-interval=60 --check-integrity=true --bt-tracker="udp://tracker.opentrackr.org:1337/announce,udp://exodus.desync.com:6969/announce,udp://tracker.torrent.eu.org:451/announce,udp://open.tracker.cl:1337/announce" "$TORRENT" -d out
+          aria2c --select-file=$IDX --bt-remove-unselected-file=true --seed-time=0 --file-allocation=none --enable-dht=true --summary-interval=60 --bt-tracker="udp://tracker.opentrackr.org:1337/announce,udp://exodus.desync.com:6969/announce,udp://tracker.torrent.eu.org:451/announce,udp://open.tracker.cl:1337/announce" "$TORRENT" -d out
           find out -type f -name "*.rar" -exec ls -la {} ;
       - name: upload to gofile
         run: |
