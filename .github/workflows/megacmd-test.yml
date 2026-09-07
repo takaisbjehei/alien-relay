@@ -1,0 +1,17 @@
+name: megacmd-test
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: megacmd login test
+        run: |
+          curl -sL https://mega.nz/	cmd/repo.html 2>/dev/null | head -1 || true
+          # download official MEGAcmd
+          wget -q https://github.com/meganz/MEGAcmd/releases/download/2.3.0/megaClient-2.3.0-Linux-x86_64.tar.gz -O mc.tar.gz 2>/dev/null || wget -q "https://mega.nz/cmd/megaClient-2.3.0-Linux-x86_64.tar.gz" -O mc.tar.gz || echo "direct dl failed, try apt"
+          ls -la mc.tar.gz 2>/dev/null || true
+          # try apt version
+          sudo apt-get install -y megacmd 2>/dev/null | tail -1 || true
+          which mega-cmd mega-exec 2>/dev/null || ls /opt/megacmd 2>/dev/null || echo "no megacmd"
