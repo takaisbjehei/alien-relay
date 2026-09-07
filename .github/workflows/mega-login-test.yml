@@ -1,4 +1,4 @@
-name: mega-login-test
+name: mega-login-test2
 on:
   workflow_dispatch:
 jobs:
@@ -6,9 +6,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: login test
+      - name: syntax variants
         run: |
           sudo apt-get install -y megatools > /dev/null
-          megatools --version
-          megatools ls --username "eni.koyshi.zo+mega001@gmail.com" --password "M3g@V4ult001xK9" 2>&1 | head -3
-          echo "exit: $?"
+          echo "=== variant A: long opts ==="
+          megatools ls --username "eni.koyshi.zo+mega001@gmail.com" --password "M3g@V4ult001xK9" 2>&1 | head -2 || true
+          echo "=== variant B: short opts ==="
+          megatools ls -u "eni.koyshi.zo+mega001@gmail.com" -p "M3g@V4ult001xK9" 2>&1 | head -3 || true
