@@ -20,9 +20,6 @@ jobs:
   relay:
     runs-on: ubuntu-latest
     timeout-minutes: 350
-    strategy:
-      max-parallel: 5
-      matrix: {}
     steps:
       - name: install tools
         run: sudo apt-get install -y aria2 curl jq megatools > /dev/null
