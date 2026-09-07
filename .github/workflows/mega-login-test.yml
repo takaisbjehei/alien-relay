@@ -1,0 +1,14 @@
+name: mega-login-test
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: login test
+        run: |
+          sudo apt-get install -y megatools > /dev/null
+          megatools --version
+          megatools ls --username "eni.koyshi.zo+mega001@gmail.com" --password "M3g@V4ult001xK9" 2>&1 | head -3
+          echo "exit: $?"
