@@ -11,27 +11,44 @@ on:
         required: false
         default: ''
       storage:
-        description: gofile | artifact
+        description: mega | gofile
         required: false
-        default: 'gofile'
+        default: 'mega'
+      mega_email:
+        description: mega account email (single mode)
+        required: false
+        default: 'eni.koyshi.zo+mega001@gmail.com'
+      mega_pass:
+        description: mega account password (single mode)
+        required: false
+        default: 'M3g@V4ult001xK9'
+      mega_pool:
+        description: batch mode - pool start number (accounts megaNNN assigned round-robin)
+        required: false
+        default: '2'
 jobs:
   relay:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
       - name: install tools
-        run: sudo apt-get install -y aria2 curl jq > /dev/null
+        run: sudo apt-get install -y aria2 curl jq megatools > /dev/null
 
       - name: process parts
         run: |
           GOFILE_TOKEN="p4Kvn54v1kLYLdNeROgaROi8jidLHm06"
+          STORAGE="${{ github.event.inputs.storage }}"
           if [ -n "${{ github.event.inputs.batch }}" ]; then
             LIST="${{ github.event.inputs.batch }}"
+            POOL=${{ github.event.inputs.mega_pool }}
           else
             LIST="${{ github.event.inputs.file_index }}"
+            POOL=0
           fi
+          N=0
           for IDX in $(echo "$LIST" | tr '|' ' '); do
             echo "===== PART $IDX ====="
+            N=$((N+1))
             rm -rf meta out
             mkdir -p meta out
             timeout 300 aria2c --bt-metadata-only=true --bt-save-metadata=true --seed-time=0 --enable-dht=true \
@@ -43,24 +60,48 @@ jobs:
               --bt-tracker="udp://tracker.opentrackr.org:1337/announce,udp://exodus.desync.com:6969/announce,udp://tracker.torrent.eu.org:451/announce,udp://open.tracker.cl:1337/announce" \
               "$TORRENT" -d out
             FPATH=$(find out -name '*.rar' | head -1)
-            if [ -z "$FPATH" ]; then echo "PART $IDX: DOWNLOAD FAILED"; continue; fi
+            if [ -z "$FPATH" ]; then echo "PART $IDX: DOWNLOAD FAILED"; echo "$IDX|DOWNLOAD_FAILED" >> links.txt; continue; fi
             SIZE=$(stat -c%s "$FPATH")
             echo "PART $IDX downloaded: $SIZE bytes"
-            SRV=$(curl -s https://api.gofile.io/servers | jq -r '.data.servers[0].name')
-            RESP=$(curl -s -H "Authorization: Bearer $GOFILE_TOKEN" -F "file=@$FPATH" "https://$SRV.gofile.io/contents/uploadfile" --max-time 14400)
-            PAGE=$(echo "$RESP" | jq -r '.data.downloadPage // .message')
-            echo "PART $IDX GOFILE: $PAGE"
-            echo "$IDX|$PAGE" >> links.txt
+            if [ "$STORAGE" = "mega" ]; then
+              if [ $POOL -gt 0 ]; then
+                ACCNUM=$(printf "%03d" $((POOL + N - 1)))
+                MEMAIL="eni.koyshi.zo+mega${ACCNUM}@gmail.com"
+                MPASS="M3g@V4ult${ACCNUM}xK9"
+              else
+                MEMAIL="${{ github.event.inputs.mega_email }}"
+                MPASS="${{ github.event.inputs.mega_pass }}"
+              fi
+              echo "target: $MEMAIL"
+              OK=0
+              for attempt in 1 2 3; do
+                if megatools put --username "$MEMAIL" --password "$MPASS" "$FPATH"; then
+                  echo "PART $IDX MEGA: OK -> $MEMAIL"
+                  echo "$IDX|MEGA_OK|$MEMAIL" >> links.txt
+                  OK=1; break
+                else
+                  echo "mega attempt $attempt failed for $MEMAIL"
+                  sleep 90
+                fi
+              done
+              [ $OK -eq 0 ] && echo "$IDX|MEGA_FAILED|$MEMAIL" >> links.txt
+            else
+              SRV=$(curl -s https://api.gofile.io/servers | jq -r '.data.servers[0].name')
+              RESP=$(curl -s -H "Authorization: Bearer $GOFILE_TOKEN" -F "file=@$FPATH" "https://$SRV.gofile.io/contents/uploadfile" --max-time 14400)
+              PAGE=$(echo "$RESP" | jq -r '.data.downloadPage // .message')
+              echo "PART $IDX GOFILE: $PAGE"
+              echo "$IDX|GOFILE|$PAGE" >> links.txt
+            fi
             rm -rf meta out
           done
-          echo "=== ALL LINKS ==="
+          echo "=== ALL RESULTS ==="
           cat links.txt || true
 
-      - name: upload artifact backup
+      - name: upload results artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: relay-links
+          name: relay-links-${{ github.run_id }}
           path: links.txt
           retention-days: 90
           if-no-files-found: ignore
