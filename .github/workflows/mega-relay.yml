@@ -12,27 +12,76 @@ on:
       mega_pass:
         description: mega account password
         required: true
+      batch:
+        description: batch mode - list of file_index:email:pass lines
+        required: false
+        default: ''
 jobs:
   relay:
     runs-on: ubuntu-latest
     timeout-minutes: 350
+    strategy:
+      max-parallel: 5
+      matrix: {}
     steps:
       - name: install tools
         run: sudo apt-get install -y aria2 curl jq megatools > /dev/null
-      - name: fetch torrent metadata
+
+      - name: batch mode - process multiple parts
+        if: ${{ github.event.inputs.batch != '' }}
         run: |
-          mkdir -p meta
-          timeout 300 aria2c --bt-metadata-only=true --bt-save-metadata=true --seed-time=0 --enable-dht=true --bt-tracker="udp://tracker.opentrackr.org:1337/announce,udp://exodus.desync.com:6969/announce,udp://tracker.torrent.eu.org:451/announce,udp://open.tracker.cl:1337/announce" 'magnet:?xt=urn:btih:169257f30c3fbee583cc3605e9653549a59a9523&dn=ALIEN_TXTBASE' -d meta
-      - name: download part
+          echo "${{ github.event.inputs.batch }}" | while IFS='|' read -r fidx memail mpass; do
+            [ -z "$fidx" ] && continue
+            echo "=== PART $fidx -> $memail ==="
+            # fetch metadata fresh each time (cache wiped between parts)
+            rm -rf meta out
+            mkdir -p meta out
+            timeout 300 aria2c --bt-metadata-only=true --bt-save-metadata=true --seed-time=0 --enable-dht=true \
+              --bt-tracker="udp://tracker.opentrackr.org:1337/announce,udp://exodus.desync.com:6969/announce,udp://tracker.torrent.eu.org:451/announce,udp://open.tracker.cl:1337/announce" \
+              'magnet:?xt=urn:btih:169257f30c3fbee583cc3605e9653549a59a9523&dn=ALIEN_TXTBASE' -d meta
+            TORRENT=meta/169257f30c3fbee583cc3605e9653549a59a9523.torrent
+            aria2c --select-file=$fidx --bt-remove-unselected-file=true --seed-time=0 --file-allocation=none --enable-dht=true \
+              --summary-interval=120 --max-tries=20 --retry-wait=30 \
+              --bt-tracker="udp://tracker.opentrackr.org:1337/announce,udp://exodus.desync.com:6969/announce,udp://tracker.torrent.eu.org:451/announce,udp://open.tracker.cl:1337/announce" \
+              "$TORRENT" -d out
+            FPATH=$(find out -name '*.rar' | head -1)
+            if [ -z "$FPATH" ]; then echo "DOWNLOAD FAILED part $fidx"; continue; fi
+            echo "downloaded: $FPATH ($(stat -c%s $FPATH) bytes)"
+            # upload with retries
+            for attempt in 1 2 3; do
+              if megatools put --username "$memail" --password "$mpass" "$FPATH"; then
+                echo "=== OK: part $fidx -> $memail ==="
+                break
+              else
+                echo "attempt $attempt failed, retrying in 60s"
+                sleep 60
+              fi
+            done
+            rm -rf meta out
+          done
+          echo "BATCH COMPLETE"
+
+      - name: single mode - process one part
+        if: ${{ github.event.inputs.batch == '' }}
         run: |
           IDX=${{ github.event.inputs.file_index }}
+          mkdir -p meta out
+          timeout 300 aria2c --bt-metadata-only=true --bt-save-metadata=true --seed-time=0 --enable-dht=true \
+            --bt-tracker="udp://tracker.opentrackr.org:1337/announce,udp://exodus.desync.com:6969/announce,udp://tracker.torrent.eu.org:451/announce,udp://open.tracker.cl:1337/announce" \
+            'magnet:?xt=urn:btih:169257f30c3fbee583cc3605e9653549a59a9523&dn=ALIEN_TXTBASE' -d meta
           TORRENT=meta/169257f30c3fbee583cc3605e9653549a59a9523.torrent
-          aria2c --select-file=$IDX --bt-remove-unselected-file=true --seed-time=0 --file-allocation=none --enable-dht=true --summary-interval=60 --bt-tracker="udp://tracker.opentrackr.org:1337/announce,udp://exodus.desync.com:6969/announce,udp://tracker.torrent.eu.org:451/announce,udp://open.tracker.cl:1337/announce" "$TORRENT" -d out
-          ls -la out/ALIEN_TXTBASE/
-      - name: upload to mega
-        run: |
+          aria2c --select-file=$IDX --bt-remove-unselected-file=true --seed-time=0 --file-allocation=none --enable-dht=true \
+            --summary-interval=120 --max-tries=20 --retry-wait=30 \
+            --bt-tracker="udp://tracker.opentrackr.org:1337/announce,udp://exodus.desync.com:6969/announce,udp://tracker.torrent.eu.org:451/announce,udp://open.tracker.cl:1337/announce" \
+            "$TORRENT" -d out
           FPATH=$(find out -name '*.rar' | head -1)
-          echo "uploading $FPATH to ${{ github.event.inputs.mega_email }}"
-          megatools put --username "${{ github.event.inputs.mega_email }}" --password "${{ github.event.inputs.mega_pass }}" "$FPATH"
-      - name: done
-        run: echo "PART RELAYED TO MEGA OK"
+          ls -la "$FPATH"
+          for attempt in 1 2 3; do
+            if megatools put --username "${{ github.event.inputs.mega_email }}" --password "${{ github.event.inputs.mega_pass }}" "$FPATH"; then
+              echo "OK: part $IDX -> ${{ github.event.inputs.mega_email }}"
+              break
+            else
+              echo "attempt $attempt failed"
+              sleep 60
+            fi
+          done
