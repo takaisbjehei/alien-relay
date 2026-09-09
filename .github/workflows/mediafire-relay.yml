@@ -1,0 +1,56 @@
+name: mediafire-relay
+on:
+  workflow_dispatch:
+    inputs:
+      batch:
+        description: pipe-separated file LINE NUMBERS from mf_files.txt (1-50)
+        required: true
+        default: '1|2|3|4|5'
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: install tools
+        run: sudo apt-get install -y curl jq aria2 > /dev/null
+
+      - name: relay files
+        run: |
+          GOFILE_TOKEN="p4Kvn54v1kLYLdNeROgaROi8jidLHm06"
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131"
+          for N in $(echo "${{ github.event.inputs.batch }}" | tr '|' ' '); do
+            echo "===== FILE $N ====="
+            # fetch file list entry
+            LINE=$(curl -s "https://www.mediafire.com/api/1.5/folder/get_content.php?folder_key=qvco18nox7703&content_type=files&response_format=json&chunk_size=100" -H "User-Agent: $UA" | jq -r ".response.folder_content.files[$((N-1))] | \"\\(.filename)|\\(.size)|\\(.links.normal_download)\"")
+            NAME=$(echo "$LINE" | cut -d'|' -f1)
+            SIZE=$(echo "$LINE" | cut -d'|' -f2)
+            PAGE=$(echo "$LINE" | cut -d'|' -f3)
+            echo "file: $NAME ($SIZE bytes)"
+            # resolve direct link
+            DIRECT=$(curl -sL "$PAGE" -H "User-Agent: $UA" | grep -oE 'https://download[0-9]+\.mediafire\.com/[^"'"'"']+' | head -1)
+            if [ -z "$DIRECT" ]; then echo "RESOLVE FAILED for $NAME"; echo "$N|$NAME|RESOLVE_FAILED" >> links.txt; continue; fi
+            # download
+            aria2c --max-connection-per-server=8 --split=8 --min-split-size=50M --file-allocation=none \
+              --summary-interval=60 --max-tries=10 --retry-wait=20 -o "$NAME" "$DIRECT" 2>&1 | tail -2
+            DLFILE=$(find . -maxdepth 1 -name "$NAME" | head -1)
+            if [ ! -f "$DLFILE" ] || [ ! -s "$DLFILE" ]; then echo "DL FAILED $NAME"; echo "$N|$NAME|DL_FAILED" >> links.txt; continue; fi
+            echo "downloaded: $(stat -c%s $DLFILE) bytes"
+            # upload to gofile
+            SRV=$(curl -s https://api.gofile.io/servers | jq -r '.data.servers[0].name')
+            RESP=$(curl -s -H "Authorization: Bearer $GOFILE_TOKEN" -F "file=@$DLFILE" "https://$SRV.gofile.io/contents/uploadfile" --max-time 14400)
+            PAGE2=$(echo "$RESP" | jq -r '.data.downloadPage // .message')
+            echo "FILE $N GOFILE: $PAGE2"
+            echo "$N|$NAME|$PAGE2" >> links.txt
+            rm -f "$DLFILE"
+          done
+          echo "=== ALL RESULTS ==="
+          cat links.txt || true
+
+      - name: upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mf-relay-links-${{ github.run_id }}
+          path: links.txt
+          retention-days: 90
+          if-no-files-found: ignore
