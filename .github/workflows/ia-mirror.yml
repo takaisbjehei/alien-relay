@@ -1,0 +1,62 @@
+name: ia-mirror
+on:
+  workflow_dispatch:
+    inputs:
+      batch:
+        description: mediafire file numbers (1-50) pipe-separated
+        required: true
+        default: '1|2|3'
+      ia_item_prefix:
+        description: IA item identifier prefix
+        required: false
+        default: 'alien-txtbase'
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: relay mediafire -> internet archive
+        shell: python
+        run: |
+          import requests, re, subprocess, time
+          UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131"
+          IA_ACCESS = "${{ secrets.IA_ACCESS_KEY }}"
+          IA_SECRET = "${{ secrets.IA_SECRET_KEY }}"
+          PREFIX = "${{ github.event.inputs.ia_item_prefix }}"
+          assert IA_ACCESS and IA_SECRET, "IA keys missing - set repo secrets"
+          nums = [int(x) for x in "${{ github.event.inputs.batch }}".split("|") if x.strip()]
+          r = requests.get(
+              "https://www.mediafire.com/api/1.5/folder/get_content.php",
+              params={"folder_key": "qvco18nox7703", "content_type": "files",
+                      "response_format": "json", "chunk_size": 100},
+              headers={"User-Agent": UA}, timeout=30)
+          files = r.json()["response"]["folder_content"]["files"]
+          for n in nums:
+              f = files[n-1]
+              name, size = f["filename"], int(f["size"])
+              page = f["links"]["normal_download"]
+              print(f"=== FILE {n}: {name} ({size}B) ===", flush=True)
+              rp = requests.get(page, headers={"User-Agent": UA}, timeout=30)
+              m = re.search(r'(https://download\d+\.mediafire\.com/[^"\x27\s]+)', rp.text)
+              if not m:
+                  print(f"RESOLVE FAILED {name}", flush=True)
+                  continue
+              ident = f"{PREFIX}-{n:03d}"
+              clean_name = name.replace("@", "at").replace(" ", "_")
+              upload_url = f"https://s3.us.archive.org/{ident}/{clean_name}"
+              cmd = (
+                  f'curl -sL "{m.group(1)}" -H "User-Agent: {UA}" | '
+                  f'curl -s -X PUT --data-binary @- '
+                  f'-H "Authorization: LOW {IA_ACCESS}:{IA_SECRET}" '
+                  f'-H "x-archive-meta01-collection: opensource_media" '
+                  f'-H "x-archive-meta-mediatype: data" '
+                  f'-H "x-archive-meta-title: {name}" '
+                  f'-H "x-archive-meta-subject: stealer logs; txtbase; alien" '
+                  f'-H "x-archive-queue-derive: 0" '
+                  f'"{upload_url}"'
+              )
+              out = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=14400)
+              ok = out.returncode == 0
+              print(f"rc={out.returncode} out={out.stdout[:120]} err={out.stderr[:120]}", flush=True)
+              print(f"FILE {n} IA: {'OK' if ok else 'CHECK'} -> https://archive.org/details/{ident}", flush=True)
+              time.sleep(10)
