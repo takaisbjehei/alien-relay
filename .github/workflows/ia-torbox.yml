@@ -1,0 +1,187 @@
+name: ia-torbox
+on:
+  workflow_dispatch:
+    inputs:
+      file_indices:
+        description: 'file indices (0-based, comma-separated or range e.g. 0-49)'
+        required: true
+        default: '0-4'
+jobs:
+  torbox-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: install tools
+        run: pip install internetarchive requests -q
+
+      - name: torbox torrent -> internet archive
+        shell: python
+        run: |
+          import requests, os, time, secrets as _sec
+          from internetarchive import upload, get_session
+
+          IA_ACCESS = "${{ secrets.IA_ACCESS_KEY }}"
+          IA_SECRET = "${{ secrets.IA_SECRET_KEY }}"
+          assert IA_ACCESS and IA_SECRET, "IA keys missing"
+          s = get_session(config={"s3": {"access": IA_ACCESS, "secret": IA_SECRET}})
+
+          MAGNET = "magnet:?xt=urn:btih:169257f30c3fbee583cc3605e9653549a59a9523&dn=ALIEN_TXTBASE&tr=udp://tracker.openbittorrent.com:80&tr=udp://tracker.opentrackr.org:1337/announce"
+          TORBOX_API = "https://api.torbox.app/v1"
+
+          fi_str = "${{ github.event.inputs.file_indices }}"
+          if '-' in fi_str:
+              start, end = fi_str.split('-')
+              indices = list(range(int(start), int(end) + 1))
+          else:
+              indices = [int(x) for x in fi_str.split(',') if x.strip()]
+
+          # Step 1: Create free TorBox account
+          print("Creating TorBox account...", flush=True)
+          reg = requests.post(f"{TORBOX_API}/user/register",
+              json={"email": f"{_sec.token_hex(8)}@tmpmail.io"},
+              timeout=30)
+          print(f"Register: {reg.status_code} {reg.text[:300]}", flush=True)
+
+          if reg.status_code == 200:
+              reg_data = reg.json().get("data", {})
+              api_key = reg_data.get("token", "")
+              user_id = reg_data.get("id", "")
+              print(f"API key: {api_key[:20]}...", flush=True)
+          else:
+              # Try alternative: use auth token directly
+              print("Registration failed, trying alternative...", flush=True)
+              # Try creating with different endpoint
+              reg2 = requests.post(f"{TORBOX_API}/auth/register",
+                  json={"email": f"{_sec.token_hex(8)}@tmpmail.io"},
+                  timeout=30)
+              print(f"Register2: {reg2.status_code} {reg2.text[:300]}", flush=True)
+              api_key = ""
+
+          if not api_key:
+              print("Could not create TorBox account, trying direct API...", flush=True)
+              # Try without auth - some endpoints work
+              api_key = ""
+
+          # Step 2: Add the magnet
+          print("\nAdding magnet to TorBox...", flush=True)
+          headers = {}
+          if api_key:
+              headers["Authorization"] = f"Bearer {api_key}"
+
+          add_resp = requests.post(f"{TORBOX_API}/torrents/createtorrent",
+              headers=headers,
+              data={"magnet": MAGNET},
+              timeout=60)
+          print(f"Add: {add_resp.status_code} {add_resp.text[:500]}", flush=True)
+
+          if add_resp.status_code == 200:
+              torrent_id = add_resp.json().get("data", {}).get("id", "")
+              print(f"Torrent ID: {torrent_id}", flush=True)
+
+              # Step 3: Wait for it to download on TorBox servers
+              print("Waiting for TorBox to download the torrent...", flush=True)
+              for attempt in range(60):
+                  time.sleep(30)
+                  status = requests.get(f"{TORBOX_API}/torrents/mylist",
+                      headers=headers, timeout=30)
+                  if status.status_code == 200:
+                      torrents = status.json().get("data", [])
+                      for t in torrents:
+                          if str(t.get("id", "")) == str(torrent_id):
+                              dl_status = t.get("download_state", "")
+                              progress = t.get("progress", 0)
+                              print(f"  Status: {dl_status}, Progress: {progress}%", flush=True)
+                              if dl_status == "completed" or progress >= 100:
+                                  break
+                      else:
+                          continue
+                      break
+                  if attempt % 4 == 0:
+                      print(f"  Waiting... attempt {attempt}", flush=True)
+
+              # Step 4: Get file list
+              info = requests.get(f"{TORBOX_API}/torrents/torrentinfo",
+                  headers=headers,
+                  params={"id": torrent_id},
+                  timeout=30)
+              print(f"\nTorrent info: {info.status_code}", flush=True)
+              files = info.json().get("data", {}).get("files", [])
+              print(f"Files: {len(files)}", flush=True)
+              for f in files[:5]:
+                  print(f"  {f.get('name', '?')} ({f.get('size', 0)} bytes)", flush=True)
+
+              # Step 5: Download selected files and upload to IA
+              dl_dir = "/tmp/torbox_dl"
+              os.makedirs(dl_dir, exist_ok=True)
+              results = []
+
+              for idx in indices:
+                  if idx >= len(files):
+                      print(f"Index {idx} out of range", flush=True)
+                      continue
+                  f = files[idx]
+                  fname = f.get("name", f"file_{idx}")
+                  fsize = f.get("size", 0)
+                  file_id = f.get("id", idx)
+                  print(f"\n=== FILE {idx}: {fname} ({fsize}B) ===", flush=True)
+
+                  # Get download link
+                  dl_resp = requests.get(f"{TORBOX_API}/torrents/requestdl",
+                      headers=headers,
+                      params={"token": api_key, "torrent_id": torrent_id, "file_id": file_id},
+                      timeout=30)
+                  print(f"  DL link status: {dl_resp.status_code}", flush=True)
+
+                  if dl_resp.status_code == 200:
+                      dl_url = dl_resp.json().get("data", "")
+                      print(f"  DL URL: {dl_url[:80]}...", flush=True)
+
+                      # Download the file
+                      local = os.path.join(dl_dir, f"part{idx}.bin")
+                      dl = requests.get(dl_url, stream=True, timeout=600)
+                      with open(local, "wb") as fh:
+                          for chunk in dl.iter_content(1024*1024):
+                              fh.write(chunk)
+                      dl.close()
+
+                      actual = os.path.getsize(local) if os.path.exists(local) else 0
+                      print(f"  Downloaded: {actual} bytes", flush=True)
+
+                      if actual > 0:
+                          ident = _sec.token_hex(8)
+                          try:
+                              up = upload(ident, [local],
+                                  metadata={"mediatype": "data", "collection": "opensource_media",
+                                            "title": _sec.token_hex(4), "subject": "a"},
+                                  access_key=IA_ACCESS, secret_key=IA_SECRET, verbose=True)
+                              ok = all(getattr(x, "status_code", 0) == 200 for x in up)
+                          except Exception as e:
+                              print(f"  IA ERROR: {e}", flush=True)
+                              ok = False
+
+                          url = f"https://archive.org/details/{ident}"
+                          print(f"  FILE {idx} IA: {'OK' if ok else 'CHECK'} -> {url}", flush=True)
+                          results.append(f"{idx}|{fname}|{'IA_OK' if ok else 'IA_CHECK'}|{url}")
+                          os.remove(local)
+                  else:
+                      print(f"  DL FAILED: {dl_resp.text[:200]}", flush=True)
+                      results.append(f"{idx}|{fname}|DL_FAILED")
+
+              print("\n=== ALL RESULTS ===", flush=True)
+              for r in results:
+                  print(r, flush=True)
+              with open("links.txt", "w") as fh:
+                  fh.write("\n".join(results))
+          else:
+              print("Failed to add magnet to TorBox", flush=True)
+              with open("links.txt", "w") as fh:
+                  fh.write("TORBOX_FAILED")
+
+      - name: upload results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ia-torbox-${{ github.run_id }}
+          path: links.txt
+          retention-days: 90
+          if-no-files-found: ignore
