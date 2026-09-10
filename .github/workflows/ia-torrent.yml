@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       file_indices:
-        description: 'torrent file indices (0-based, comma-separated, e.g. 0,1,2 or 100-110)'
+        description: 'torrent file indices (0-based, comma-separated e.g. 0,1,2,3,4 or range 0-49)'
         required: true
         default: '0-4'
 jobs:
@@ -14,7 +14,7 @@ jobs:
       - name: install tools
         run: |
           sudo apt-get update -qq > /dev/null
-          sudo apt-get install -y -qq transmission-cli > /dev/null
+          sudo apt-get install -y -qq aria2 > /dev/null
           pip install internetarchive requests -q
 
       - name: download and upload torrent files
@@ -30,7 +30,6 @@ jobs:
 
           MAGNET = "magnet:?xt=urn:btih:169257f30c3fbee583cc3605e9653549a59a9523&dn=ALIEN_TXTBASE&tr=udp://tracker.openbittorrent.com:80&tr=udp://tracker.opentrackr.org:1337/announce"
 
-          # Parse file indices
           fi_str = "${{ github.event.inputs.file_indices }}"
           if '-' in fi_str:
               start, end = fi_str.split('-')
@@ -41,41 +40,75 @@ jobs:
           dl_dir = "/tmp/torrent"
           os.makedirs(dl_dir, exist_ok=True)
 
-          # Start transmission-cli with specific file selection
-          # --peers 50 for faster download, --downlimit 0 for unlimited
-          file_select = ",".join(str(i) for i in indices)
-          cmd = [
-              "transmission-cli",
-              "--download-dir", dl_dir,
-              "--files", file_select,
-              "--no-global-change",
+          # Use aria2c to get torrent metadata first
+          print("Fetching torrent metadata...", flush=True)
+          meta_cmd = [
+              "aria2c", "--enable-dht=true", "--bt-enable-lpd=true",
+              "--bt-tracker=udp://tracker.openbittorrent.com:80,udp://tracker.opentrackr.org:1337/announce,udp://explodie.org:6969,udp://tracker.torrent.eu.org:451",
+              "--dir", dl_dir, "--seed-time=0", "--bt-stop-timeout=60",
+              "--summary-interval=0", "--console-log-level=warn",
+              "--follow-torrent=true", "--check-integrity=false",
               MAGNET
           ]
-          print(f"Starting torrent with files: {file_select}", flush=True)
-          proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+          proc = subprocess.Popen(meta_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
-          # Wait for torrent to start and get file list
-          time.sleep(20)
+          # Wait for metadata
+          time.sleep(45)
+          proc.terminate()
 
-          # Monitor download progress
-          max_wait = 300  # 5 min max per file batch
+          # Find .torrent file or metadata
+          torrent_files = glob.glob(os.path.join(dl_dir, "*.torrent"))
+          print(f"Torrent files found: {len(torrent_files)}", flush=True)
+
+          # Get file list from aria2c
+          if torrent_files:
+              # Use show-files to list contents
+              show_cmd = ["aria2c", "--show-files=true", torrent_files[0]]
+              result = subprocess.run(show_cmd, capture_output=True, text=True, timeout=30)
+              print(f"File list:\n{result.stdout[:2000]}", flush=True)
+              print(f"Stderr:\n{result.stderr[:1000]}", flush=True)
+
+          # Build select string for aria2c (1-based index)
+          select_str = ",".join(str(i + 1) for i in indices)
+          print(f"Selecting files: {select_str}", flush=True)
+
+          # Now download selected files
+          dl_cmd = [
+              "aria2c", "--enable-dht=true", "--bt-enable-lpd=true",
+              "--bt-tracker=udp://tracker.openbittorrent.com:80,udp://tracker.opentrackr.org:1337/announce,udp://explodie.org:6969,udp://tracker.torrent.eu.org:451",
+              "--dir", dl_dir, "--seed-time=0",
+              "--bt-stop-timeout=300",
+              "--select-file=" + select_str,
+              "--follow-torrent=true", "--check-integrity=false",
+              "--max-overall-upload-limit=100K", "--summary-interval=10",
+              "--console-log-level=notice",
+              MAGNET
+          ]
+          print(f"Starting aria2c download...", flush=True)
+          proc = subprocess.Popen(dl_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+          # Wait and monitor
+          max_wait = 600
           elapsed = 0
           while elapsed < max_wait:
-              # Check if any files exist
-              all_files = glob.glob(os.path.join(dl_dir, "**", "*"), recursive=True)
-              data_files = [f for f in all_files if os.path.isfile(f) and not f.endswith('.torrent')]
-              if data_files:
-                  print(f"Found {len(data_files)} files, checking completion...", flush=True)
-                  # Check if any file is complete (size > 1MB and not growing)
-                  for f in data_files[:3]:
-                      sz = os.path.getsize(f)
-                      print(f"  {os.path.basename(f)}: {sz} bytes", flush=True)
-              time.sleep(10)
-              elapsed += 10
-              if elapsed % 30 == 0:
-                  print(f"Waiting for torrent... {elapsed}s", flush=True)
+              time.sleep(15)
+              elapsed += 15
+              all_files = glob.glob(os.path.join(dl_dir, "**", "*.txt"), recursive=True) + \
+                         glob.glob(os.path.join(dl_dir, "**", "*.rar"), recursive=True) + \
+                         glob.glob(os.path.join(dl_dir, "**", "*.7z"), recursive=True)
+              all_files = [f for f in all_files if os.path.getsize(f) > 1024]
+              if all_files:
+                  print(f"Found {len(all_files)} files after {elapsed}s", flush=True)
+                  for f in all_files[:5]:
+                      print(f"  {os.path.basename(f)}: {os.path.getsize(f)} bytes", flush=True)
+                  if len(all_files) >= len(indices):
+                      break
+              if elapsed % 60 == 0:
+                  print(f"Still downloading... {elapsed}s", flush=True)
 
-          # Find completed files
+          proc.terminate()
+
+          # Find all completed files
           all_files = sorted(glob.glob(os.path.join(dl_dir, "**", "*"), recursive=True))
           data_files = [f for f in all_files if os.path.isfile(f) and not f.endswith('.torrent') and os.path.getsize(f) > 1024]
 
@@ -101,11 +134,8 @@ jobs:
               url = f"https://archive.org/details/{ident}"
               print(f"FILE {idx} IA: {'OK' if ok else 'CHECK'} -> {url}", flush=True)
               results.append(f"{idx}|{fname}|{'IA_OK' if ok else 'IA_CHECK'}|{url}")
-
-              # Delete local to save space
               os.remove(fpath)
 
-          proc.terminate()
           print("\n=== ALL RESULTS ===", flush=True)
           for r in results:
               print(r, flush=True)
