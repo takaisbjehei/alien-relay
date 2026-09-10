@@ -46,7 +46,7 @@ jobs:
               upload_url = f"https://s3.us.archive.org/{ident}/{clean_name}"
               cmd = (
                   f'curl -sL "{m.group(1)}" -H "User-Agent: {UA}" | '
-                  f'curl -s -X PUT --data-binary @- '
+                  f'curl -s -X PUT -T - '
                   f'-H "Authorization: LOW {IA_ACCESS}:{IA_SECRET}" '
                   f'-H "x-archive-meta01-collection: opensource_media" '
                   f'-H "x-archive-meta-mediatype: data" '
