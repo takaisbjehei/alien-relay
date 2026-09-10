@@ -23,7 +23,7 @@ jobs:
       - name: relay mediafire -> internet archive
         shell: python
         run: |
-          import requests, re, os, time
+          import requests, re, os, time, subprocess
           from internetarchive import upload, get_session
           UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131"
           IA_ACCESS = "${{ secrets.IA_ACCESS_KEY }}"
