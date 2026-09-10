@@ -1,0 +1,130 @@
+name: ia-torrent
+on:
+  workflow_dispatch:
+    inputs:
+      file_range:
+        description: 'file numbers to upload (e.g. 1-50 or 100,200,300)'
+        required: true
+        default: '1-10'
+jobs:
+  torrent-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: install tools
+        run: |
+          sudo apt-get update -qq > /dev/null
+          sudo apt-get install -y -qq transmission-cli > /dev/null
+          pip install internetarchive requests -q
+
+      - name: download and upload torrent files
+        shell: python
+        run: |
+          import requests, re, os, secrets as _sec, subprocess, glob, time
+          from internetarchive import upload, get_session
+
+          IA_ACCESS = "${{ secrets.IA_ACCESS_KEY }}"
+          IA_SECRET = "${{ secrets.IA_SECRET_KEY }}"
+          assert IA_ACCESS and IA_SECRET, "IA keys missing"
+          s = get_session(config={"s3": {"access": IA_ACCESS, "secret": IA_SECRET}})
+
+          MAGNET = "magnet:?xt=urn:btih:169257f30c3fbee583cc3605e9653549a59a9523&dn=ALIEN_TXTBASE&tr=udp://tracker.openbittorrent.com:80&tr=udp://tracker.opentrackr.org:1337/announce"
+
+          # Parse file range
+          fr = "${{ github.event.inputs.file_range }}"
+          if '-' in fr:
+              start, end = fr.split('-')
+              nums = list(range(int(start), int(end) + 1))
+          else:
+              nums = [int(x) for x in fr.split(',') if x.strip()]
+
+          # Start torrent download in background
+          dl_dir = "/tmp/torrent"
+          os.makedirs(dl_dir, exist_ok=True)
+          proc = subprocess.Popen(
+              ["transmission-cli", "--download-dir", dl_dir, "-w", dl_dir, MAGNET],
+              stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+              )
+
+          # Wait for torrent metadata
+          print("Waiting for torrent metadata...", flush=True)
+          time.sleep(30)
+
+          # Find files in torrent
+          all_files = sorted(glob.glob(os.path.join(dl_dir, "**", "*.txt"), recursive=True) +
+                           glob.glob(os.path.join(dl_dir, "**", "*.rar"), recursive=True) +
+                           glob.glob(os.path.join(dl_dir, "**", "*.7z"), recursive=True) +
+                           glob.glob(os.path.join(dl_dir, "**", "*.zip"), recursive=True))
+
+          print(f"Found {len(all_files)} files in torrent", flush=True)
+
+          results = []
+          for n in nums:
+              if n > len(all_files):
+                  print(f"File {n} exceeds torrent file count ({len(all_files)})", flush=True)
+                  continue
+              fpath = all_files[n - 1]
+              fname = os.path.basename(fpath)
+              fsize = os.path.getsize(fpath)
+              print(f"=== FILE {n}: {fname} ({fsize}B) ===", flush=True)
+
+              # Wait for file to complete downloading
+              timeout = 600
+              elapsed = 0
+              while elapsed < timeout:
+                  # Check if file size matches expected (if we can determine it)
+                  # For now, just check if file exists and is non-empty
+                  if os.path.exists(fpath) and os.path.getsize(fpath) > 0:
+                      # Try to read last few bytes to check if download is complete
+                      with open(fpath, 'rb') as fh:
+                          fh.seek(max(0, os.path.getsize(fpath) - 1024))
+                          last_chunk = fh.read()
+                      # If file is stable for 5 seconds, consider it done
+                      time.sleep(5)
+                      if os.path.getsize(fpath) == fsize or os.path.getsize(fpath) >= fsize * 0.99:
+                          break
+                  time.sleep(10)
+                  elapsed += 10
+                  if elapsed % 60 == 0:
+                      print(f"  waiting... {elapsed}s, size={os.path.getsize(fpath) if os.path.exists(fpath) else 0}", flush=True)
+
+              if not os.path.exists(fpath) or os.path.getsize(fpath) == 0:
+                  print(f"FILE {n} FAILED: not downloaded", flush=True)
+                  results.append(f"{n}|{fname}|DL_FAILED")
+                  continue
+
+              actual_size = os.path.getsize(fpath)
+              print(f"downloaded {actual_size} bytes", flush=True)
+
+              ident = _sec.token_hex(8)
+              try:
+                  up = upload(ident, [fpath],
+                      metadata={"mediatype": "data", "collection": "opensource_media",
+                                "title": _sec.token_hex(4), "subject": "a"},
+                      access_key=IA_ACCESS, secret_key=IA_SECRET, verbose=True)
+                  ok = all(getattr(x, "status_code", 0) == 200 for x in up)
+              except Exception as e:
+                  print(f"IA ERROR: {e}", flush=True)
+                  ok = False
+
+              print(f"FILE {n} IA: {'OK' if ok else 'CHECK'} -> https://archive.org/details/{ident}", flush=True)
+              results.append(f"{n}|{fname}|{'IA_OK' if ok else 'IA_CHECK'}|https://archive.org/details/{ident}")
+
+              # Delete local file to save space
+              os.remove(fpath)
+
+          proc.terminate()
+          print("=== ALL RESULTS ===", flush=True)
+          for r in results:
+              print(r, flush=True)
+          with open("links.txt", "w") as fh:
+              fh.write("\n".join(results))
+
+      - name: upload results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ia-torrent-${{ github.run_id }}
+          path: links.txt
+          retention-days: 90
+          if-no-files-found: ignore
