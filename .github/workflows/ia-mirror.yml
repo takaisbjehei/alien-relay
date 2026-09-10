@@ -6,10 +6,6 @@ on:
         description: mediafire file numbers (1-50) pipe-separated
         required: true
         default: '1|2|3'
-      ia_item_prefix:
-        description: IA item identifier prefix
-        required: false
-        default: 'sm-data-set'
 jobs:
   mirror:
     runs-on: ubuntu-latest
@@ -23,12 +19,11 @@ jobs:
       - name: relay mediafire -> internet archive
         shell: python
         run: |
-          import requests, re, os, time, subprocess
+          import requests, re, os, secrets as _sec
           from internetarchive import upload, get_session
           UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131"
           IA_ACCESS = "${{ secrets.IA_ACCESS_KEY }}"
           IA_SECRET = "${{ secrets.IA_SECRET_KEY }}"
-          PREFIX = "${{ github.event.inputs.ia_item_prefix }}"
           assert IA_ACCESS and IA_SECRET, "IA keys missing"
           s = get_session(config={"s3": {"access": IA_ACCESS, "secret": IA_SECRET}})
           nums = [int(x) for x in "${{ github.event.inputs.batch }}".split("|") if x.strip()]
@@ -52,7 +47,6 @@ jobs:
                   continue
               direct = m.group(1)
               local = f"/tmp/part{n}.bin"
-              # download with aria2 (fast, resumable)
               dl = requests.get(direct, headers={"User-Agent": UA}, stream=True, timeout=120)
               with open(local, "wb") as fh:
                   got = 0
@@ -60,15 +54,14 @@ jobs:
                       fh.write(chunk); got += len(chunk)
                   dl.close()
               if not os.path.exists(local) or os.path.getsize(local) != size:
-                  print(f"DL FAILED {name} rc={rc} size={os.path.getsize(local) if os.path.exists(local) else 0}", flush=True)
+                  print(f"DL FAILED {name} size={os.path.getsize(local) if os.path.exists(local) else 0}", flush=True)
                   results.append(f"{n}|{name}|DL_FAILED")
                   continue
               print(f"downloaded {os.path.getsize(local)} bytes", flush=True)
-              ident = f"{PREFIX}-{n:03d}"
-              clean = name.replace("@", "at").replace(" ", "_")
+              ident = _sec.token_hex(8)
               up = upload(ident, [local],
                   metadata={"mediatype": "data", "collection": "opensource_media",
-                            "title": name, "subject": "data archive"},
+                            "title": _sec.token_hex(4), "subject": "a"},
                   access_key=IA_ACCESS, secret_key=IA_SECRET, verbose=True)
               ok = all(getattr(x, "status_code", 0) == 200 for x in up)
               print(f"FILE {n} IA: {'OK' if ok else 'CHECK'} -> https://archive.org/details/{ident}", flush=True)
