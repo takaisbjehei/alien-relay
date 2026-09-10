@@ -2,10 +2,10 @@ name: ia-torrent
 on:
   workflow_dispatch:
     inputs:
-      file_range:
-        description: 'file numbers to upload (e.g. 1-50 or 100,200,300)'
+      file_indices:
+        description: 'torrent file indices (0-based, comma-separated, e.g. 0,1,2 or 100-110)'
         required: true
-        default: '1-10'
+        default: '0-4'
 jobs:
   torrent-upload:
     runs-on: ubuntu-latest
@@ -20,7 +20,7 @@ jobs:
       - name: download and upload torrent files
         shell: python
         run: |
-          import requests, re, os, secrets as _sec, subprocess, glob, time
+          import requests, re, os, secrets as _sec, subprocess, glob, time, json
           from internetarchive import upload, get_session
 
           IA_ACCESS = "${{ secrets.IA_ACCESS_KEY }}"
@@ -30,71 +30,62 @@ jobs:
 
           MAGNET = "magnet:?xt=urn:btih:169257f30c3fbee583cc3605e9653549a59a9523&dn=ALIEN_TXTBASE&tr=udp://tracker.openbittorrent.com:80&tr=udp://tracker.opentrackr.org:1337/announce"
 
-          # Parse file range
-          fr = "${{ github.event.inputs.file_range }}"
-          if '-' in fr:
-              start, end = fr.split('-')
-              nums = list(range(int(start), int(end) + 1))
+          # Parse file indices
+          fi_str = "${{ github.event.inputs.file_indices }}"
+          if '-' in fi_str:
+              start, end = fi_str.split('-')
+              indices = list(range(int(start), int(end) + 1))
           else:
-              nums = [int(x) for x in fr.split(',') if x.strip()]
+              indices = [int(x) for x in fi_str.split(',') if x.strip()]
 
-          # Start torrent download in background
           dl_dir = "/tmp/torrent"
           os.makedirs(dl_dir, exist_ok=True)
-          proc = subprocess.Popen(
-              ["transmission-cli", "--download-dir", dl_dir, "-w", dl_dir, MAGNET],
-              stdout=subprocess.PIPE, stderr=subprocess.STDOUT
-              )
 
-          # Wait for torrent metadata
-          print("Waiting for torrent metadata...", flush=True)
-          time.sleep(30)
+          # Start transmission-cli with specific file selection
+          # --peers 50 for faster download, --downlimit 0 for unlimited
+          file_select = ",".join(str(i) for i in indices)
+          cmd = [
+              "transmission-cli",
+              "--download-dir", dl_dir,
+              "--files", file_select,
+              "--no-global-change",
+              MAGNET
+          ]
+          print(f"Starting torrent with files: {file_select}", flush=True)
+          proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
-          # Find files in torrent
-          all_files = sorted(glob.glob(os.path.join(dl_dir, "**", "*.txt"), recursive=True) +
-                           glob.glob(os.path.join(dl_dir, "**", "*.rar"), recursive=True) +
-                           glob.glob(os.path.join(dl_dir, "**", "*.7z"), recursive=True) +
-                           glob.glob(os.path.join(dl_dir, "**", "*.zip"), recursive=True))
+          # Wait for torrent to start and get file list
+          time.sleep(20)
 
-          print(f"Found {len(all_files)} files in torrent", flush=True)
+          # Monitor download progress
+          max_wait = 300  # 5 min max per file batch
+          elapsed = 0
+          while elapsed < max_wait:
+              # Check if any files exist
+              all_files = glob.glob(os.path.join(dl_dir, "**", "*"), recursive=True)
+              data_files = [f for f in all_files if os.path.isfile(f) and not f.endswith('.torrent')]
+              if data_files:
+                  print(f"Found {len(data_files)} files, checking completion...", flush=True)
+                  # Check if any file is complete (size > 1MB and not growing)
+                  for f in data_files[:3]:
+                      sz = os.path.getsize(f)
+                      print(f"  {os.path.basename(f)}: {sz} bytes", flush=True)
+              time.sleep(10)
+              elapsed += 10
+              if elapsed % 30 == 0:
+                  print(f"Waiting for torrent... {elapsed}s", flush=True)
+
+          # Find completed files
+          all_files = sorted(glob.glob(os.path.join(dl_dir, "**", "*"), recursive=True))
+          data_files = [f for f in all_files if os.path.isfile(f) and not f.endswith('.torrent') and os.path.getsize(f) > 1024]
+
+          print(f"\nFound {len(data_files)} completed files", flush=True)
 
           results = []
-          for n in nums:
-              if n > len(all_files):
-                  print(f"File {n} exceeds torrent file count ({len(all_files)})", flush=True)
-                  continue
-              fpath = all_files[n - 1]
+          for idx, fpath in enumerate(data_files):
               fname = os.path.basename(fpath)
               fsize = os.path.getsize(fpath)
-              print(f"=== FILE {n}: {fname} ({fsize}B) ===", flush=True)
-
-              # Wait for file to complete downloading
-              timeout = 600
-              elapsed = 0
-              while elapsed < timeout:
-                  # Check if file size matches expected (if we can determine it)
-                  # For now, just check if file exists and is non-empty
-                  if os.path.exists(fpath) and os.path.getsize(fpath) > 0:
-                      # Try to read last few bytes to check if download is complete
-                      with open(fpath, 'rb') as fh:
-                          fh.seek(max(0, os.path.getsize(fpath) - 1024))
-                          last_chunk = fh.read()
-                      # If file is stable for 5 seconds, consider it done
-                      time.sleep(5)
-                      if os.path.getsize(fpath) == fsize or os.path.getsize(fpath) >= fsize * 0.99:
-                          break
-                  time.sleep(10)
-                  elapsed += 10
-                  if elapsed % 60 == 0:
-                      print(f"  waiting... {elapsed}s, size={os.path.getsize(fpath) if os.path.exists(fpath) else 0}", flush=True)
-
-              if not os.path.exists(fpath) or os.path.getsize(fpath) == 0:
-                  print(f"FILE {n} FAILED: not downloaded", flush=True)
-                  results.append(f"{n}|{fname}|DL_FAILED")
-                  continue
-
-              actual_size = os.path.getsize(fpath)
-              print(f"downloaded {actual_size} bytes", flush=True)
+              print(f"\n=== FILE {idx}: {fname} ({fsize}B) ===", flush=True)
 
               ident = _sec.token_hex(8)
               try:
@@ -107,14 +98,15 @@ jobs:
                   print(f"IA ERROR: {e}", flush=True)
                   ok = False
 
-              print(f"FILE {n} IA: {'OK' if ok else 'CHECK'} -> https://archive.org/details/{ident}", flush=True)
-              results.append(f"{n}|{fname}|{'IA_OK' if ok else 'IA_CHECK'}|https://archive.org/details/{ident}")
+              url = f"https://archive.org/details/{ident}"
+              print(f"FILE {idx} IA: {'OK' if ok else 'CHECK'} -> {url}", flush=True)
+              results.append(f"{idx}|{fname}|{'IA_OK' if ok else 'IA_CHECK'}|{url}")
 
-              # Delete local file to save space
+              # Delete local to save space
               os.remove(fpath)
 
           proc.terminate()
-          print("=== ALL RESULTS ===", flush=True)
+          print("\n=== ALL RESULTS ===", flush=True)
           for r in results:
               print(r, flush=True)
           with open("links.txt", "w") as fh:
