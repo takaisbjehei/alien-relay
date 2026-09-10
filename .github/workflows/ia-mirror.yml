@@ -45,7 +45,7 @@ jobs:
               page = f["links"]["normal_download"]
               print(f"=== FILE {n}: {name} ({size}B) ===", flush=True)
               rp = requests.get(page, headers={"User-Agent": UA}, timeout=30)
-              m = re.search(r"(https://download\d+\.mediafire\.com/[^\"\\x27\\s]+)", rp.text)
+              m = re.search(r"(https://download\d+\.mediafire\.com/[^" + chr(34) + chr(39) + r"\s]+)", rp.text)
               if not m:
                   print(f"RESOLVE FAILED {name}", flush=True)
                   results.append(f"{n}|{name}|RESOLVE_FAILED")
