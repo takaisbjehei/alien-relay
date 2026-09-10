@@ -53,8 +53,8 @@ jobs:
               direct = m.group(1)
               local = f"/tmp/part{n}.bin"
               # download with aria2 (fast, resumable)
-              rc = subprocess.call(["aria2c", "--max-connection-per-server=8", "--split=8",
-                  "--min-split-size=50M", "--file-allocation=none", "--summary-interval=60",
+              rc = subprocess.call(["aria2c", "--max-connection-per-server=1", "--split=1",
+                  "--file-allocation=none", "--summary-interval=60",
                   "-o", local, direct], timeout=7200)
               if rc != 0 or not os.path.exists(local) or os.path.getsize(local) != size:
                   print(f"DL FAILED {name} rc={rc} size={os.path.getsize(local) if os.path.exists(local) else 0}", flush=True)
