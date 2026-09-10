@@ -9,54 +9,78 @@ on:
       ia_item_prefix:
         description: IA item identifier prefix
         required: false
-        default: 'alien-txtbase'
+        default: 'sm-data-set'
 jobs:
   mirror:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
+      - name: install tools
+        run: |
+          sudo apt-get install -y python3-pip > /dev/null
+          pip install internetarchive requests -q
+
       - name: relay mediafire -> internet archive
         shell: python
         run: |
-          import requests, re, subprocess, time
+          import requests, re, os, time
+          from internetarchive import upload, get_session
           UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131"
           IA_ACCESS = "${{ secrets.IA_ACCESS_KEY }}"
           IA_SECRET = "${{ secrets.IA_SECRET_KEY }}"
           PREFIX = "${{ github.event.inputs.ia_item_prefix }}"
-          assert IA_ACCESS and IA_SECRET, "IA keys missing - set repo secrets"
+          assert IA_ACCESS and IA_SECRET, "IA keys missing"
+          s = get_session(config={"s3": {"access": IA_ACCESS, "secret": IA_SECRET}})
           nums = [int(x) for x in "${{ github.event.inputs.batch }}".split("|") if x.strip()]
-          r = requests.get(
+          results = []
+          mr = requests.get(
               "https://www.mediafire.com/api/1.5/folder/get_content.php",
               params={"folder_key": "qvco18nox7703", "content_type": "files",
                       "response_format": "json", "chunk_size": 100},
               headers={"User-Agent": UA}, timeout=30)
-          files = r.json()["response"]["folder_content"]["files"]
+          files = mr.json()["response"]["folder_content"]["files"]
           for n in nums:
               f = files[n-1]
               name, size = f["filename"], int(f["size"])
               page = f["links"]["normal_download"]
               print(f"=== FILE {n}: {name} ({size}B) ===", flush=True)
               rp = requests.get(page, headers={"User-Agent": UA}, timeout=30)
-              m = re.search(r'(https://download\d+\.mediafire\.com/[^"\x27\s]+)', rp.text)
+              m = re.search(r"(https://download\d+\.mediafire\.com/[^\"\\x27\\s]+)", rp.text)
               if not m:
                   print(f"RESOLVE FAILED {name}", flush=True)
+                  results.append(f"{n}|{name}|RESOLVE_FAILED")
                   continue
+              direct = m.group(1)
+              local = f"/tmp/part{n}.bin"
+              # download with aria2 (fast, resumable)
+              rc = subprocess.call(["aria2c", "--max-connection-per-server=8", "--split=8",
+                  "--min-split-size=50M", "--file-allocation=none", "--summary-interval=60",
+                  "-o", local, direct], timeout=7200)
+              if rc != 0 or not os.path.exists(local) or os.path.getsize(local) != size:
+                  print(f"DL FAILED {name} rc={rc} size={os.path.getsize(local) if os.path.exists(local) else 0}", flush=True)
+                  results.append(f"{n}|{name}|DL_FAILED")
+                  continue
+              print(f"downloaded {os.path.getsize(local)} bytes", flush=True)
               ident = f"{PREFIX}-{n:03d}"
-              clean_name = name.replace("@", "at").replace(" ", "_")
-              upload_url = f"https://s3.us.archive.org/{ident}/{clean_name}"
-              cmd = (
-                  f'curl -sL "{m.group(1)}" -H "User-Agent: {UA}" | '
-                  f'curl -s -X PUT -T - '
-                  f'-H "Authorization: LOW {IA_ACCESS}:{IA_SECRET}" '
-                  f'-H "x-archive-meta01-collection: opensource_media" '
-                  f'-H "x-archive-meta-mediatype: data" '
-                  f'-H "x-archive-meta-title: {name}" '
-                  f'-H "x-archive-meta-subject: stealer logs; txtbase; alien" '
-                  f'-H "x-archive-queue-derive: 0" '
-                  f'"{upload_url}"'
-              )
-              out = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=14400)
-              ok = out.returncode == 0
-              print(f"rc={out.returncode} out={out.stdout[:120]} err={out.stderr[:120]}", flush=True)
+              clean = name.replace("@", "at").replace(" ", "_")
+              up = upload(ident, [local],
+                  metadata={"mediatype": "data", "collection": "opensource_media",
+                            "title": name, "subject": "data archive"},
+                  access_key=IA_ACCESS, secret_key=IA_SECRET, verbose=True)
+              ok = all(getattr(x, "status_code", 0) == 200 for x in up)
               print(f"FILE {n} IA: {'OK' if ok else 'CHECK'} -> https://archive.org/details/{ident}", flush=True)
-              time.sleep(10)
+              results.append(f"{n}|{name}|{'IA_OK' if ok else 'IA_CHECK'}|https://archive.org/details/{ident}")
+              os.remove(local)
+          print("=== ALL RESULTS ===", flush=True)
+          for r in results: print(r, flush=True)
+          with open("links.txt", "w") as fh:
+              fh.write("\n".join(results))
+
+      - name: upload results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ia-links-${{ github.run_id }}
+          path: links.txt
+          retention-days: 90
+          if-no-files-found: ignore
