@@ -1,0 +1,143 @@
+name: ia-webtor
+on:
+  workflow_dispatch:
+    inputs:
+      file_indices:
+        description: 'file indices (0-based, comma-separated or range)'
+        required: true
+        default: '0-4'
+jobs:
+  webtor-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: install tools
+        run: pip install internetarchive requests -q
+
+      - name: webtor torrent -> internet archive
+        shell: python
+        run: |
+          import requests, os, time, secrets as _sec, json
+          from internetarchive import upload, get_session
+
+          IA_ACCESS = "${{ secrets.IA_ACCESS_KEY }}"
+          IA_SECRET = "${{ secrets.IA_SECRET_KEY }}"
+          assert IA_ACCESS and IA_SECRET, "IA keys missing"
+          s = get_session(config={"s3": {"access": IA_ACCESS, "secret": IA_SECRET}})
+
+          MAGNET = "magnet:?xt=urn:btih:169257f30c3fbee583cc3605e9653549a59a9523&dn=ALIEN_TXTBASE&tr=udp://tracker.openbittorrent.com:80&tr=udp://tracker.opentrackr.org:1337/announce"
+          WEBTOR_API = "https://webtor.io/api"
+
+          fi_str = "${{ github.event.inputs.file_indices }}"
+          if '-' in fi_str:
+              start, end = fi_str.split('-')
+              indices = list(range(int(start), int(end) + 1))
+          else:
+              indices = [int(x) for x in fi_str.split(',') if x.strip()]
+
+          dl_dir = "/tmp/webtor"
+          os.makedirs(dl_dir, exist_ok=True)
+          ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131"
+
+          # Step 1: Submit the magnet to webtor.io
+          print("Submitting magnet to webtor.io...", flush=True)
+          submit = requests.post(f"{WEBTOR_API}/torrents",
+              headers={"User-Agent": ua, "Content-Type": "application/json"},
+              json={"src": MAGNET},
+              timeout=60)
+          print(f"Submit: {submit.status_code}", flush=True)
+          print(submit.text[:500], flush=True)
+
+          if submit.status_code in (200, 201):
+              tid = submit.json().get("id", "")
+              print(f"Torrent ID: {tid}", flush=True)
+
+              # Step 2: Wait for files to be ready
+              print("Waiting for webtor to fetch torrent...", flush=True)
+              files = []
+              for attempt in range(120):
+                  time.sleep(10)
+                  info = requests.get(f"{WEBTOR_API}/torrents/{tid}",
+                      headers={"User-Agent": ua}, timeout=30)
+                  if info.status_code == 200:
+                      data = info.json()
+                      status = data.get("status", "")
+                      files = data.get("files", [])
+                      print(f"  Attempt {attempt}: status={status}, files={len(files)}", flush=True)
+                      if files:
+                          for f in files[:5]:
+                              print(f"    {f.get('name', '?')} ({f.get('size', 0)})", flush=True)
+                          break
+                  else:
+                      print(f"  Attempt {attempt}: HTTP {info.status_code}", flush=True)
+                  if attempt % 6 == 0:
+                      print(f"  Still waiting... {attempt * 10}s", flush=True)
+
+              # Step 3: Download selected files
+              results = []
+              for idx in indices:
+                  if idx >= len(files):
+                      print(f"Index {idx} out of range ({len(files)} files)", flush=True)
+                      continue
+                  f = files[idx]
+                  fname = f.get("name", f"file_{idx}")
+                  fsize = f.get("size", 0)
+                  print(f"\n=== FILE {idx}: {fname} ({fsize}B) ===", flush=True)
+
+                  # Get the download URL
+                  dl_url = f"{WEBTOR_API}/torrents/{tid}/files/{idx}/stream"
+                  print(f"  Downloading from: {dl_url}", flush=True)
+
+                  local = os.path.join(dl_dir, f"part{idx}.bin")
+                  try:
+                      dl = requests.get(dl_url, headers={"User-Agent": ua},
+                          stream=True, timeout=600)
+                      if dl.status_code == 200:
+                          with open(local, "wb") as fh:
+                              for chunk in dl.iter_content(1024*1024):
+                                  fh.write(chunk)
+                          dl.close()
+                          actual = os.path.getsize(local) if os.path.exists(local) else 0
+                          print(f"  Downloaded: {actual} bytes", flush=True)
+
+                          if actual > 0:
+                              ident = _sec.token_hex(8)
+                              try:
+                                  up = upload(ident, [local],
+                                      metadata={"mediatype": "data", "collection": "opensource_media",
+                                                "title": _sec.token_hex(4), "subject": "a"},
+                                      access_key=IA_ACCESS, secret_key=IA_SECRET, verbose=True)
+                                  ok = all(getattr(x, "status_code", 0) == 200 for x in up)
+                              except Exception as e:
+                                  print(f"  IA ERROR: {e}", flush=True)
+                                  ok = False
+
+                              url = f"https://archive.org/details/{ident}"
+                              print(f"  FILE {idx} IA: {'OK' if ok else 'CHECK'} -> {url}", flush=True)
+                              results.append(f"{idx}|{fname}|{'IA_OK' if ok else 'IA_CHECK'}|{url}")
+                              os.remove(local)
+                      else:
+                          print(f"  DL FAILED: HTTP {dl.status_code}", flush=True)
+                          results.append(f"{idx}|{fname}|DL_FAILED_HTTP{dl.status_code}")
+                  except Exception as e:
+                      print(f"  DL ERROR: {e}", flush=True)
+                      results.append(f"{idx}|{fname}|DL_ERROR")
+
+              print("\n=== ALL RESULTS ===", flush=True)
+              for r in results:
+                  print(r, flush=True)
+              with open("links.txt", "w") as fh:
+                  fh.write("\n".join(results))
+          else:
+              print("Failed to submit magnet to webtor.io", flush=True)
+              with open("links.txt", "w") as fh:
+                  fh.write("WEBTOR_FAILED")
+
+      - name: upload results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ia-webtor-${{ github.run_id }}
+          path: links.txt
+          retention-days: 90
+          if-no-files-found: ignore
