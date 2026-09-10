@@ -53,9 +53,12 @@ jobs:
               direct = m.group(1)
               local = f"/tmp/part{n}.bin"
               # download with aria2 (fast, resumable)
-              rc = subprocess.call(["aria2c", "--max-connection-per-server=1", "--split=1",
-                  "--file-allocation=none", "--summary-interval=60",
-                  "-o", local, direct], timeout=7200)
+              dl = requests.get(direct, headers={"User-Agent": UA}, stream=True, timeout=120)
+              with open(local, "wb") as fh:
+                  got = 0
+                  for chunk in dl.iter_content(1024*1024):
+                      fh.write(chunk); got += len(chunk)
+                  dl.close()
               if rc != 0 or not os.path.exists(local) or os.path.getsize(local) != size:
                   print(f"DL FAILED {name} rc={rc} size={os.path.getsize(local) if os.path.exists(local) else 0}", flush=True)
                   results.append(f"{n}|{name}|DL_FAILED")
